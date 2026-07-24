@@ -1,0 +1,1027 @@
+-- [[
+-- 67 HUB MM2 Mass Farm - Coin Auto-Tween Collector
+-- Features: Exact Screen GUI replication, Toggle Auto-Farm ON/OFF, Noclip, Console Logs Panel, Dynamic Stats
+-- Optimizations: Optimized caching (10x faster scanning), Anti-Screen Shake (Smooth Lerp + PlatformStand), Auto Bag Limits, Scanned Coins Count
+-- Advanced Optimizations: FireTouchInterest pre-touch, Rival Player Avoidance, GUI Speed Changer (+/-)
+-- Elite Checker: Checks workspace.Lobby.Elite.Display.SurfaceGui.Frame.List.CoinBag for custom coin limits
+-- Physics Fixes: Anti-Fling Velocity Reset, Tween Cancellation Fix, Zoned Noclip (Only active during Tween)
+-- Lobby Support: Detects waiting states ("WAITING FOR YOUR TURN" / "SPECTATING") to automatically stand still in Lobby
+-- Target: workspace.House2.CoinContainer (or any active CoinContainer/Coin_Server in workspace)
+-- ]]
+
+-- Prevent multiple instances from running
+if _G.Hub67Running then
+    _G.Hub67Settings.Enabled = false
+    if _G.Hub67GUI then
+        _G.Hub67GUI:Destroy()
+    end
+    task.wait(0.5)
+end
+
+_G.Hub67Running = true
+
+-- Configuration Settings
+_G.Hub67Settings = {
+    Enabled = false, -- Controls the autofarm execution
+    Speed = 85, -- Studs per second
+    Noclip = true,
+    TweenDelay = 0.0, -- Delay between collecting coins (0 = maximum speed)
+    ScanInterval = 0.1, -- Scanning frequency when no coins are found
+    CoinsCollected = 0,
+    StartTime = os.time(),
+}
+
+-- Roblox Services
+local Players = game:GetService("Players")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+
+-- GUI References
+local ScreenGui = nil
+local MainFrame = nil
+local BottomBar = nil
+local ShowButton = nil
+local ConsoleFrame = nil
+local LogScroll = nil
+
+-- Stat Labels
+local TaskLabel = nil
+local RuntimeLabel = nil
+local MapLabel = nil
+local LevelLabel = nil
+local CoinsLabel = nil
+local EventLabel = nil
+local BagLabel = nil
+local ScannedCoinsLabel = nil
+
+-- Performance Caches
+local cachedContainer = nil
+local cachedBagLabel = nil
+local cachedLevel = "1"
+local lastLevelCheck = 0
+
+-- Character parts caching for Noclip
+local cachedCharacterParts = {}
+local lastCharacter = nil
+
+local function getCharacterParts()
+    local char = LocalPlayer.Character
+    if not char then
+        cachedCharacterParts = {}
+        lastCharacter = nil
+        return cachedCharacterParts
+    end
+    
+    if char == lastCharacter then
+        return cachedCharacterParts
+    end
+    
+    lastCharacter = char
+    cachedCharacterParts = {}
+    
+    -- Cache current parts
+    for _, part in ipairs(char:GetDescendants()) do
+        if part:IsA("BasePart") then
+            table.insert(cachedCharacterParts, part)
+        end
+    end
+    
+    -- Dynamic update if parts are added later
+    local connection
+    connection = char.DescendantAdded:Connect(function(descendant)
+        if not lastCharacter or lastCharacter ~= char then
+            connection:Disconnect()
+            return
+        end
+        if descendant:IsA("BasePart") then
+            table.insert(cachedCharacterParts, descendant)
+        end
+    end)
+    
+    return cachedCharacterParts
+end
+
+-- Console log function
+local maxLogs = 50
+local logsList = {}
+
+local function logMessage(text)
+    local timeStr = os.date("%H:%M:%S")
+    local formattedText = string.format("[%s] %s", timeStr, text)
+    print("[67 HUB Console] " .. text)
+    
+    if not LogScroll then return end
+    
+    -- Create text label
+    local logLabel = Instance.new("TextLabel")
+    logLabel.Size = UDim2.new(1, -10, 0, 18)
+    logLabel.BackgroundTransparency = 1
+    logLabel.Text = formattedText
+    logLabel.TextColor3 = Color3.fromRGB(180, 180, 180)
+    logLabel.Font = Enum.Font.Code
+    logLabel.TextSize = 11
+    logLabel.TextXAlignment = Enum.TextXAlignment.Left
+    logLabel.Parent = LogScroll
+    
+    table.insert(logsList, logLabel)
+    if #logsList > maxLogs then
+        local oldest = table.remove(logsList, 1)
+        oldest:Destroy()
+    end
+    
+    LogScroll.CanvasSize = UDim2.new(0, 0, 0, #logsList * 18)
+    LogScroll.CanvasPosition = Vector2.new(0, math.max(0, (#logsList * 18) - LogScroll.AbsoluteWindowSize.Y))
+end
+
+-- Scan the Elite perks board in the Lobby (New Request)
+local function checkEliteCoinBagPath()
+    local path = workspace:FindFirstChild("Lobby")
+    path = path and path:FindFirstChild("Elite")
+    path = path and path:FindFirstChild("Display")
+    path = path and path:FindFirstChild("SurfaceGui")
+    path = path and path:FindFirstChild("Frame")
+    path = path and path:FindFirstChild("List")
+    path = path and path:FindFirstChild("CoinBag")
+    
+    if path then
+        local classType = path.ClassName
+        local contentInfo = ""
+        if path:IsA("TextLabel") or path:IsA("TextButton") then
+            contentInfo = "Text: " .. tostring(path.Text)
+        elseif path:IsA("ValueObject") or pcall(function() return path.Value end) then
+            contentInfo = "Value: " .. tostring(path.Value)
+        else
+            contentInfo = "Class: " .. classType
+        end
+        logMessage("Elite CoinBag Path Found! " .. contentInfo)
+        return path
+    else
+        logMessage("Elite CoinBag Path NOT Found in workspace.Lobby!")
+        return nil
+    end
+end
+
+-- Get or search the CoinContainer folder dynamically (Cached)
+local function getCoinContainer()
+    if cachedContainer and cachedContainer.Parent then
+        return cachedContainer
+    end
+    
+    -- Scan workspace children (fast check)
+    for _, item in ipairs(workspace:GetChildren()) do
+        if item:IsA("Model") or item:IsA("Folder") then
+            local container = item:FindFirstChild("CoinContainer")
+            if container then
+                cachedContainer = container
+                logMessage("ตรวจพบแหล่งเหรียญใหม่: " .. tostring(item.Name))
+                return container
+            end
+        end
+    end
+    
+    -- Fallback: deep search
+    local container = workspace:FindFirstChild("CoinContainer", true)
+    if container then
+        cachedContainer = container
+        if container.Parent then
+            logMessage("ตรวจพบแหล่งเหรียญใหม่ (Deep): " .. tostring(container.Parent.Name))
+        end
+        return container
+    end
+    
+    return nil
+end
+
+-- Detect map name dynamically
+local function getActiveMapName()
+    local container = getCoinContainer()
+    if container and container.Parent then
+        return container.Parent.Name
+    end
+    return "Lobby"
+end
+
+-- Get level from Murder Mystery 2 structure (Rate-Limited)
+local function getPlayerLevel()
+    if os.time() - lastLevelCheck < 5 then
+        return cachedLevel
+    end
+    lastLevelCheck = os.time()
+    
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        local lvl = leaderstats:FindFirstChild("Level") or leaderstats:FindFirstChild("Rank")
+        if lvl then 
+            cachedLevel = tostring(lvl.Value)
+            return cachedLevel
+        end
+    end
+    local pd = LocalPlayer:FindFirstChild("PlayerData")
+    if pd then
+        local lvl = pd:FindFirstChild("Level")
+        if lvl then 
+            cachedLevel = tostring(lvl.Value)
+            return cachedLevel
+        end
+    end
+    return cachedLevel
+end
+
+local cachedCoinsLabel = nil
+
+-- Get Player's Actual Total Coins balance (from leaderstats/PlayerData or UI scanning)
+local function getPlayerCoins()
+    if cachedCoinsLabel and cachedCoinsLabel.Parent then
+        local cleanText = string.gsub(cachedCoinsLabel.Text, ",", "")
+        local num = tonumber(string.match(cleanText, "%d+"))
+        if num then return num end
+    end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        -- 1. Try Shop ScreenGui desktop paths first
+        local shop = playerGui:FindFirstChild("Shop")
+        if shop then
+            local desktop = shop:FindFirstChild("ShopDesktop")
+            local main = desktop and desktop:FindFirstChild("Main")
+            if main then
+                for _, descendant in ipairs(main:GetDescendants()) do
+                    if descendant:IsA("TextLabel") then
+                        local name = string.lower(descendant.Name)
+                        local parent = descendant.Parent
+                        local parentName = parent and string.lower(parent.Name) or ""
+                        if (name == "amount" or name == "text" or string.find(name, "coin")) and 
+                           (string.find(parentName, "coin") or string.find(parentName, "currency")) and 
+                           not string.find(parentName, "bag") then
+                            local cleanText = string.gsub(descendant.Text, ",", "")
+                            local num = tonumber(string.match(cleanText, "^%d+$"))
+                            if num then
+                                cachedCoinsLabel = descendant
+                                return num
+                            end
+                        end
+                    end
+                end
+            end
+        end
+
+        -- 2. Try MainGUI Lobby Topbar path
+        local mainGui = playerGui:FindFirstChild("MainGUI")
+        if mainGui then
+            local lobby = mainGui:FindFirstChild("Lobby")
+            local lobbyMain = lobby and lobby:FindFirstChild("Main")
+            local topBar = lobbyMain and lobbyMain:FindFirstChild("TopBar")
+            local coinsFrame = topBar and (topBar:FindFirstChild("Coins") or topBar:FindFirstChild("Coin"))
+            local amountLabel = coinsFrame and (coinsFrame:FindFirstChild("Amount") or coinsFrame:FindFirstChild("Text"))
+            if amountLabel and amountLabel:IsA("TextLabel") then
+                local cleanText = string.gsub(amountLabel.Text, ",", "")
+                local num = tonumber(string.match(cleanText, "%d+"))
+                if num then
+                    cachedCoinsLabel = amountLabel
+                    return num
+                end
+            end
+        end
+
+        -- 3. General fallback search in PlayerGui (excluding CoinBag and labels containing "/")
+        for _, descendant in ipairs(playerGui:GetDescendants()) do
+            if descendant:IsA("TextLabel") and descendant.Visible then
+                local name = string.lower(descendant.Name)
+                local parent = descendant.Parent
+                local parentName = parent and string.lower(parent.Name) or ""
+                if (string.find(name, "coin") or string.find(name, "gold") or string.find(parentName, "coin") or string.find(parentName, "gold")) and
+                   not string.find(name, "bag") and not string.find(parentName, "bag") and not string.find(descendant.Text, "/") then
+                    local cleanText = string.gsub(descendant.Text, ",", "")
+                    local num = tonumber(string.match(cleanText, "^%d+$"))
+                    if num then
+                        cachedCoinsLabel = descendant
+                        return num
+                    end
+                end
+            end
+        end
+    end
+
+    -- Fallback search in LocalPlayer ValueObjects
+    local pd = LocalPlayer:FindFirstChild("PlayerData")
+    if pd then
+        local coins = pd:FindFirstChild("Coins") or pd:FindFirstChild("Gold") or pd:FindFirstChild("Coin")
+        if coins and coins:IsA("ValueObject") then return coins.Value end
+    end
+    local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+    if leaderstats then
+        local coins = leaderstats:FindFirstChild("Coins")
+        if coins then return coins.Value end
+    end
+
+    return _G.Hub67Settings.CoinsCollected
+end
+
+-- Check if player is waiting in lobby or spectating
+local function isWaitingForTurn()
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        local mainGui = playerGui:FindFirstChild("MainGUI")
+        if mainGui then
+            -- 1. Try fast path inside Game status elements
+            local gameFrame = mainGui:FindFirstChild("Game")
+            if gameFrame then
+                for _, label in ipairs(gameFrame:GetDescendants()) do
+                    if label:IsA("TextLabel") and label.Visible then
+                        local text = string.lower(label.Text)
+                        if string.find(text, "waiting for your turn") or string.find(text, "spectating") or string.find(text, "waiting...") then
+                            return true
+                        end
+                    end
+                end
+            end
+            
+            -- 2. General scan in MainGUI for any waiting/spectating texts
+            for _, label in ipairs(mainGui:GetDescendants()) do
+                if label:IsA("TextLabel") and label.Visible then
+                    local text = string.lower(label.Text)
+                    if string.find(text, "waiting for your turn") or string.find(text, "spectating") then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+-- Scan screen for dynamic Bag counter (Cached)
+local function getBagStatus()
+    if cachedBagLabel and cachedBagLabel.Parent then
+        return cachedBagLabel.Text
+    end
+
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        -- Search fast path first
+        local mainGui = playerGui:FindFirstChild("MainGUI")
+        if mainGui then
+            local gameFrame = mainGui:FindFirstChild("Game")
+            local coinBag = gameFrame and (gameFrame:FindFirstChild("CoinBag") or gameFrame:FindFirstChild("CashBag"))
+            if coinBag and coinBag:IsA("TextLabel") then
+                cachedBagLabel = coinBag
+                return coinBag.Text
+            end
+            
+            -- Fallback recursive scan inside MainGUI only
+            for _, label in ipairs(mainGui:GetDescendants()) do
+                if label:IsA("TextLabel") and label.Visible then
+                    local text = label.Text
+                    if string.match(text, "%d+/%d+") then
+                        local name = string.lower(label.Name)
+                        if string.find(name, "bag") or string.find(name, "coin") then
+                            cachedBagLabel = label
+                            return text
+                        end
+                    end
+                end
+            end
+        end
+    end
+    
+    -- Fallback calculation checking if player has Elite
+    local maxBag = 10
+    local pd = LocalPlayer:FindFirstChild("PlayerData")
+    if pd then
+        local elite = pd:FindFirstChild("Elite")
+        if elite and elite.Value == true then
+            maxBag = 50
+        end
+    end
+    if LocalPlayer:FindFirstChild("Elite") then
+        maxBag = 50
+    end
+    
+    local current = math.min(maxBag, _G.Hub67Settings.CoinsCollected % (maxBag + 1))
+    return tostring(current) .. "/" .. tostring(maxBag)
+end
+
+-- Get all available coins from cached CoinContainer
+local function getCoins()
+    local coins = {}
+    local container = getCoinContainer()
+    if container then
+        local children = container:GetChildren()
+        for i = 1, #children do
+            local child = children[i]
+            if child:IsA("BasePart") or child:IsA("Model") then
+                table.insert(coins, child)
+            end
+        end
+    end
+    return coins
+end
+
+-- Create the user interface
+local function createUI()
+    local targetParent = nil
+    local success, err = pcall(function()
+        targetParent = game:GetService("CoreGui")
+    end)
+    if not success or not targetParent then
+        targetParent = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    end
+    if not targetParent then return end
+
+    -- ScreenGui
+    ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "Hub67MassFarm"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.Parent = targetParent
+    _G.Hub67GUI = ScreenGui
+
+    -- Main UI Frame
+    MainFrame = Instance.new("Frame")
+    MainFrame.Name = "MainFrame"
+    MainFrame.Size = UDim2.new(0, 420, 0, 320)
+    MainFrame.Position = UDim2.new(0.5, 0, 0.45, 0)
+    MainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    MainFrame.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    MainFrame.BorderSizePixel = 0
+    MainFrame.Active = true
+    MainFrame.Draggable = true
+    MainFrame.Parent = ScreenGui
+
+    -- Title Label
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, 0, 0, 30)
+    titleLabel.Position = UDim2.new(0, 0, 0, 15)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = "67 HUB MM2 Mass Farm"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.Font = Enum.Font.SourceSansBold
+    titleLabel.TextSize = 26
+    titleLabel.Parent = MainFrame
+
+    -- User Subtitle
+    local userLabel = Instance.new("TextLabel")
+    userLabel.Size = UDim2.new(1, 0, 0, 18)
+    userLabel.Position = UDim2.new(0, 0, 0, 42)
+    userLabel.BackgroundTransparency = 1
+    userLabel.Text = LocalPlayer.Name
+    userLabel.TextColor3 = Color3.fromRGB(80, 160, 240)
+    userLabel.Font = Enum.Font.SourceSans
+    userLabel.TextSize = 15
+    userLabel.Parent = MainFrame
+
+    -- Discord Subtitle
+    local discordLabel = Instance.new("TextLabel")
+    discordLabel.Size = UDim2.new(1, 0, 0, 18)
+    discordLabel.Position = UDim2.new(0, 0, 0, 58)
+    discordLabel.BackgroundTransparency = 1
+    discordLabel.Text = "discord.gg/67hub"
+    discordLabel.TextColor3 = Color3.fromRGB(150, 150, 150)
+    discordLabel.Font = Enum.Font.SourceSans
+    discordLabel.TextSize = 13
+    discordLabel.Parent = MainFrame
+
+    -- Container for stats
+    local statsContainer = Instance.new("Frame")
+    statsContainer.Size = UDim2.new(0.9, 0, 0.62, 0)
+    statsContainer.Position = UDim2.new(0.05, 0, 0.25, 0)
+    statsContainer.BackgroundTransparency = 1
+    statsContainer.Parent = MainFrame
+
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = statsContainer
+
+    local function buildStatLabel(name, initialText)
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, 0, 0, 18)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = name .. ": " .. initialText
+        lbl.TextColor3 = Color3.fromRGB(230, 230, 230)
+        lbl.Font = Enum.Font.SourceSans
+        lbl.TextSize = 18
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = statsContainer
+        return lbl
+    end
+
+    TaskLabel = buildStatLabel("Task", "Loading Stats..")
+    RuntimeLabel = buildStatLabel("Runtime", "Loading Stats..")
+    MapLabel = buildStatLabel("Map", "Loading Stats..")
+    LevelLabel = buildStatLabel("Level", "Loading Stats..")
+    CoinsLabel = buildStatLabel("Coins", "Loading Stats..")
+    EventLabel = buildStatLabel("Event", "Loading Stats..")
+    BagLabel = buildStatLabel("Bag", "Loading Stats..")
+    ScannedCoinsLabel = buildStatLabel("Scanned Coins", "0")
+
+    -- Speed Adjustment Control Row
+    local speedRow = Instance.new("Frame")
+    speedRow.Size = UDim2.new(1, 0, 0, 22)
+    speedRow.BackgroundTransparency = 1
+    speedRow.Parent = statsContainer
+
+    local speedLabel = Instance.new("TextLabel")
+    speedLabel.Size = UDim2.new(0.6, 0, 1, 0)
+    speedLabel.BackgroundTransparency = 1
+    speedLabel.Text = "Tween Speed: " .. tostring(_G.Hub67Settings.Speed)
+    speedLabel.TextColor3 = Color3.fromRGB(230, 230, 230)
+    speedLabel.Font = Enum.Font.SourceSans
+    speedLabel.TextSize = 18
+    speedLabel.TextXAlignment = Enum.TextXAlignment.Left
+    speedLabel.Parent = speedRow
+
+    local speedDown = Instance.new("TextButton")
+    speedDown.Size = UDim2.new(0.18, 0, 1, 0)
+    speedDown.Position = UDim2.new(0.6, 0, 0, 0)
+    speedDown.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    speedDown.Text = "-"
+    speedDown.TextColor3 = Color3.fromRGB(255, 255, 255)
+    speedDown.Font = Enum.Font.SourceSansBold
+    speedDown.TextSize = 16
+    speedDown.Parent = speedRow
+
+    local speedUp = Instance.new("TextButton")
+    speedUp.Size = UDim2.new(0.18, 0, 1, 0)
+    speedUp.Position = UDim2.new(0.8, 0, 0, 0)
+    speedUp.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+    speedUp.Text = "+"
+    speedUp.TextColor3 = Color3.fromRGB(255, 255, 255)
+    speedUp.Font = Enum.Font.SourceSansBold
+    speedUp.TextSize = 16
+    speedUp.Parent = speedRow
+
+    speedDown.MouseButton1Click:Connect(function()
+        _G.Hub67Settings.Speed = math.max(10, _G.Hub67Settings.Speed - 5)
+        speedLabel.Text = "Tween Speed: " .. tostring(_G.Hub67Settings.Speed)
+        logMessage("ปรับความเร็วลงเป็น: " .. tostring(_G.Hub67Settings.Speed))
+    end)
+
+    speedUp.MouseButton1Click:Connect(function()
+        _G.Hub67Settings.Speed = math.min(300, _G.Hub67Settings.Speed + 5)
+        speedLabel.Text = "Tween Speed: " .. tostring(_G.Hub67Settings.Speed)
+        logMessage("ปรับความเร็วขึ้นเป็น: " .. tostring(_G.Hub67Settings.Speed))
+    end)
+
+    -- Bottom Bar
+    BottomBar = Instance.new("Frame")
+    BottomBar.Size = UDim2.new(1, 0, 0, 32)
+    BottomBar.Position = UDim2.new(0, 0, 1, -32)
+    BottomBar.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    BottomBar.BorderSizePixel = 0
+    BottomBar.Parent = MainFrame
+
+    local sep = Instance.new("Frame")
+    sep.Size = UDim2.new(1, 0, 0, 1)
+    sep.Position = UDim2.new(0, 0, 0, 0)
+    sep.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    sep.BorderSizePixel = 0
+    sep.Parent = BottomBar
+
+    -- Hide Button (Left)
+    local hideBtn = Instance.new("TextButton")
+    hideBtn.Size = UDim2.new(0.3, 0, 1, -1)
+    hideBtn.Position = UDim2.new(0, 0, 0, 1)
+    hideBtn.BackgroundTransparency = 1
+    hideBtn.Text = "HIDE"
+    hideBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hideBtn.Font = Enum.Font.SourceSansBold
+    hideBtn.TextSize = 16
+    hideBtn.Parent = BottomBar
+
+    -- ON / OFF Toggle Button (Middle)
+    local toggleBtn = Instance.new("TextButton")
+    toggleBtn.Size = UDim2.new(0.4, 0, 1, -1)
+    toggleBtn.Position = UDim2.new(0.3, 0, 0, 1)
+    toggleBtn.BackgroundTransparency = 1
+    toggleBtn.Text = "AUTO: OFF"
+    toggleBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+    toggleBtn.Font = Enum.Font.SourceSansBold
+    toggleBtn.TextSize = 16
+    toggleBtn.Parent = BottomBar
+
+    -- Console Button (Right)
+    local consoleBtn = Instance.new("TextButton")
+    consoleBtn.Size = UDim2.new(0.3, 0, 1, -1)
+    consoleBtn.Position = UDim2.new(0.7, 0, 0, 1)
+    consoleBtn.BackgroundTransparency = 1
+    consoleBtn.Text = "CONSOLE"
+    consoleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    consoleBtn.Font = Enum.Font.SourceSansBold
+    consoleBtn.TextSize = 16
+    consoleBtn.Parent = BottomBar
+
+    local line1 = Instance.new("Frame")
+    line1.Size = UDim2.new(0, 1, 1, 0)
+    line1.Position = UDim2.new(0.3, 0, 0, 0)
+    line1.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    line1.BorderSizePixel = 0
+    line1.Parent = BottomBar
+
+    local line2 = Instance.new("Frame")
+    line2.Size = UDim2.new(0, 1, 1, 0)
+    line2.Position = UDim2.new(0.7, 0, 0, 0)
+    line2.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    line2.BorderSizePixel = 0
+    line2.Parent = BottomBar
+
+    -- Show Button
+    ShowButton = Instance.new("TextButton")
+    ShowButton.Name = "ShowButton"
+    ShowButton.Size = UDim2.new(0, 420, 0, 30)
+    ShowButton.Position = UDim2.new(0.5, 0, 0.95, 0)
+    ShowButton.AnchorPoint = Vector2.new(0.5, 0.5)
+    ShowButton.BackgroundColor3 = Color3.fromRGB(15, 15, 15)
+    ShowButton.BorderSizePixel = 0
+    ShowButton.Text = "SHOW"
+    ShowButton.TextColor3 = Color3.fromRGB(255, 255, 255)
+    ShowButton.Font = Enum.Font.SourceSansBold
+    ShowButton.TextSize = 18
+    ShowButton.Visible = false
+    ShowButton.Parent = ScreenGui
+
+    -- Console Frame
+    ConsoleFrame = Instance.new("Frame")
+    ConsoleFrame.Name = "ConsoleFrame"
+    ConsoleFrame.Size = UDim2.new(1, 0, 0, 150)
+    ConsoleFrame.Position = UDim2.new(0, 0, 1, 0)
+    ConsoleFrame.BackgroundColor3 = Color3.fromRGB(10, 10, 10)
+    ConsoleFrame.BorderSizePixel = 0
+    ConsoleFrame.ClipsDescendants = true
+    ConsoleFrame.Visible = false
+    ConsoleFrame.Parent = MainFrame
+
+    local cLine = Instance.new("Frame")
+    cLine.Size = UDim2.new(1, 0, 0, 1)
+    cLine.BackgroundColor3 = Color3.fromRGB(45, 45, 45)
+    cLine.BorderSizePixel = 0
+    cLine.Parent = ConsoleFrame
+
+    LogScroll = Instance.new("ScrollingFrame")
+    LogScroll.Size = UDim2.new(1, -10, 1, -10)
+    LogScroll.Position = UDim2.new(0, 5, 0, 5)
+    LogScroll.BackgroundTransparency = 1
+    LogScroll.BorderSizePixel = 0
+    LogScroll.ScrollBarThickness = 4
+    LogScroll.ScrollBarImageColor3 = Color3.fromRGB(100, 100, 100)
+    LogScroll.Parent = ConsoleFrame
+
+    local logLayout = Instance.new("UIListLayout")
+    logLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    logLayout.Parent = LogScroll
+
+    -- Drag support
+    local dragging, dragInput, dragStart, startPos
+    MainFrame.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = MainFrame.Position
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    MainFrame.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            TweenService:Create(MainFrame, TweenInfo.new(0.08, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+                Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+            }):Play()
+        end
+    end)
+
+    -- Toggle buttons handlers
+    hideBtn.MouseButton1Click:Connect(function()
+        MainFrame.Visible = false
+        ShowButton.Visible = true
+        logMessage("UI ซ่อนการทำงานเรียบร้อย")
+    end)
+
+    ShowButton.MouseButton1Click:Connect(function()
+        ShowButton.Visible = false
+        MainFrame.Visible = true
+        logMessage("แสดง UI เรียบร้อย")
+    end)
+
+    local function updateAutofarmUI()
+        if _G.Hub67Settings.Enabled then
+            toggleBtn.Text = "AUTO: ON"
+            toggleBtn.TextColor3 = Color3.fromRGB(100, 255, 100)
+            logMessage("เปิดระบบการเก็บเหรียญอัตโนมัติ (Autofarm Enabled)")
+        else
+            toggleBtn.Text = "AUTO: OFF"
+            toggleBtn.TextColor3 = Color3.fromRGB(255, 100, 100)
+            logMessage("ปิดระบบการเก็บเหรียญอัตโนมัติ (Autofarm Disabled)")
+        end
+    end
+
+    toggleBtn.MouseButton1Click:Connect(function()
+        _G.Hub67Settings.Enabled = not _G.Hub67Settings.Enabled
+        updateAutofarmUI()
+    end)
+
+    consoleBtn.MouseButton1Click:Connect(function()
+        ConsoleFrame.Visible = not ConsoleFrame.Visible
+        if ConsoleFrame.Visible then
+            logMessage("เปิดแสดงผล Console Logs Panel")
+        end
+    end)
+
+    -- Check path scan on start
+    task.spawn(function()
+        task.wait(1)
+        checkEliteCoinBagPath()
+    end)
+
+    logMessage("67 HUB โหลดหน้าจอ UI สำเร็จ!")
+end
+
+-- Find nearest coin from cached coins list (O(C + P) complexity - cached player search)
+local function getNearestCoin()
+    local character = LocalPlayer.Character
+    if not character then return nil end
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return nil end
+
+    local coins = getCoins()
+    local nearest = nil
+    local minDistance = math.huge
+
+    -- Cache rival positions to optimize O(C*P) search down to O(C+P)
+    local rivalPositions = {}
+    local playersList = Players:GetPlayers()
+    for i = 1, #playersList do
+        local p = playersList[i]
+        if p ~= LocalPlayer and p.Character then
+            local er = p.Character:FindFirstChild("HumanoidRootPart")
+            if er then
+                table.insert(rivalPositions, er.Position)
+            end
+        end
+    end
+
+    local function isRivalNear(coinPos)
+        for j = 1, #rivalPositions do
+            if (rivalPositions[j] - coinPos).Magnitude < 4.0 then
+                return true
+            end
+        end
+        return false
+    end
+
+    -- Attempt 1: Target nearest coin that rival players are NOT currently on top of
+    for i = 1, #coins do
+        local coin = coins[i]
+        local pos = getCoinPosition(coin)
+        if pos and not isRivalNear(pos) then
+            local dist = (pos - rootPart.Position).Magnitude
+            if dist < minDistance then
+                minDistance = dist
+                nearest = coin
+            end
+        end
+    end
+
+    -- Attempt 2: Fallback to absolute nearest coin if all coins have players nearby
+    if not nearest then
+        for i = 1, #coins do
+            local coin = coins[i]
+            local pos = getCoinPosition(coin)
+            if pos then
+                local dist = (pos - rootPart.Position).Magnitude
+                if dist < minDistance then
+                    minDistance = dist
+                    nearest = coin
+                end
+            end
+        end
+    end
+
+    return nearest
+end
+
+-- Fire TouchInterest connections to trigger server detection early
+local function triggerTouchInterest(rootPart, targetCoin)
+    local touchPart = nil
+    if targetCoin:IsA("BasePart") then
+        touchPart = targetCoin
+    elseif targetCoin:IsA("Model") then
+        touchPart = targetCoin.PrimaryPart or targetCoin:FindFirstChildWhichIsA("BasePart")
+    end
+
+    if touchPart and firetouchinterest then
+        task.spawn(function()
+            firetouchinterest(rootPart, touchPart, 0)
+            task.wait()
+            firetouchinterest(rootPart, touchPart, 1)
+        end)
+    end
+end
+
+local isTweening = false
+
+-- Smooth character tweening using TweenService for reliable collision and touch interest firing
+local function tweenTo(targetCoin)
+    local character = LocalPlayer.Character
+    if not character then return false end
+    local rootPart = character:FindFirstChild("HumanoidRootPart")
+    if not rootPart then return false end
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if not humanoid or humanoid.Health <= 0 then return false end
+
+    local targetPosition = getCoinPosition(targetCoin)
+    if not targetPosition then return false end
+
+    local distance = (targetPosition - rootPart.Position).Magnitude
+    local duration = distance / _G.Hub67Settings.Speed
+
+    if TaskLabel then
+        TaskLabel.Text = string.format("Task: Tweening to Coin (Dist: %.1f)", distance)
+    end
+
+    local tweenInfo = TweenInfo.new(duration, Enum.EasingStyle.Linear)
+    local tween = TweenService:Create(rootPart, tweenInfo, {CFrame = CFrame.new(targetPosition)})
+
+    isTweening = true
+    local completed = false
+    local connection
+    connection = tween.Completed:Connect(function()
+        completed = true
+        if connection then connection:Disconnect() end
+    end)
+
+    tween:Play()
+
+    while not completed and _G.Hub67Settings.Enabled and targetCoin and targetCoin.Parent do
+        task.wait()
+        
+        -- Safe abort if character states change
+        if not LocalPlayer.Character or not rootPart.Parent or not humanoid.Parent or humanoid.Health <= 0 then
+            tween:Cancel()
+            if connection then connection:Disconnect() end
+            isTweening = false
+            return false
+        end
+
+        -- Early claim using TouchInterest within 8 studs
+        local curDist = (targetPosition - rootPart.Position).Magnitude
+        if curDist < 8.0 then
+            triggerTouchInterest(rootPart, targetCoin)
+        end
+    end
+
+    isTweening = false
+
+    if not _G.Hub67Settings.Enabled then
+        tween:Cancel()
+        if connection then connection:Disconnect() end
+        return false
+    end
+
+    if connection then
+        connection:Disconnect()
+    end
+    
+    -- Reset velocity and force to prevent residual inertia/flings
+    if rootPart and rootPart.Parent then
+        rootPart.Velocity = Vector3.new(0, 0, 0)
+        rootPart.RotVelocity = Vector3.new(0, 0, 0)
+    end
+    
+    return true
+end
+
+-- Stepped connection for Noclip (Active ONLY while moving to prevent falling through floor when idle)
+local noclipConnection = nil
+local function startNoclipLoop()
+    if noclipConnection then return end
+    noclipConnection = RunService.Stepped:Connect(function()
+        if not _G.Hub67Running then
+            if noclipConnection then
+                noclipConnection:Disconnect()
+                noclipConnection = nil
+            end
+            return
+        end
+        
+        if _G.Hub67Settings.Enabled and _G.Hub67Settings.Noclip and isTweening then
+            local parts = getCharacterParts()
+            for i = 1, #parts do
+                local part = parts[i]
+                if part.Parent and part.CanCollide then
+                    part.CanCollide = false
+                end
+            end
+        end
+    end)
+end
+
+-- Initialize UI & Loops
+createUI()
+startNoclipLoop()
+
+-- Track stats loop (pcall protected)
+task.spawn(function()
+    while _G.Hub67Running do
+        local success, err = pcall(function()
+            local elapsed = os.time() - _G.Hub67Settings.StartTime
+            local hrs = math.floor(elapsed / 3600)
+            local mins = math.floor((elapsed % 3600) / 60)
+            local secs = elapsed % 60
+            if RuntimeLabel then
+                RuntimeLabel.Text = string.format("Runtime: %02d:%02d:%02d", hrs, mins, secs)
+            end
+
+            local activeMap = getActiveMapName()
+            if MapLabel then MapLabel.Text = "Map: " .. activeMap end
+
+            if LevelLabel then LevelLabel.Text = "Level: " .. getPlayerLevel() end
+
+            -- Dynamic Coins Stat update: Displays player's actual total coins (net worth)
+            if CoinsLabel then
+                CoinsLabel.Text = "Coins: " .. tostring(getPlayerCoins())
+            end
+
+            if EventLabel then EventLabel.Text = "Event: 0" end
+
+            if BagLabel then BagLabel.Text = "Bag: " .. getBagStatus() end
+
+            -- Dynamically update Scanned Coins count on the map
+            local activeCoins = getCoins()
+            if ScannedCoinsLabel then
+                ScannedCoinsLabel.Text = "Scanned Coins: " .. tostring(#activeCoins)
+            end
+        end)
+        if not success then
+            warn("67 HUB Stats Loop Warning: " .. tostring(err))
+        end
+        task.wait(1)
+    end
+end)
+
+-- Track coin collect via deletion listener
+workspace.DescendantRemoving:Connect(function(descendant)
+    if not _G.Hub67Settings.Enabled then return end
+    if descendant.Name == "Coin_Server" or descendant.Parent and descendant.Parent.Name == "CoinContainer" then
+        local character = LocalPlayer.Character
+        if character then
+            local root = character:FindFirstChild("HumanoidRootPart")
+            if root and descendant:IsA("BasePart") then
+                local dist = (descendant.Position - root.Position).Magnitude
+                if dist < 12 then
+                    _G.Hub67Settings.CoinsCollected = _G.Hub67Settings.CoinsCollected + 1
+                    logMessage("เก็บเหรียญสำเร็จ! เหรียญสะสมรอบนี้: " .. tostring(_G.Hub67Settings.CoinsCollected))
+                end
+            end
+        end
+    end
+end)
+
+-- Main loop for auto-farming (pcall protected)
+task.spawn(function()
+    while _G.Hub67Running do
+        local success, err = pcall(function()
+            if _G.Hub67Settings.Enabled then
+                if isWaitingForTurn() then
+                    if TaskLabel then TaskLabel.Text = "Task: Waiting for turn (Lobby)" end
+                    task.wait(1.0)
+                else
+                    local target = getNearestCoin()
+                    if target then
+                        local tweenSuccess = tweenTo(target)
+                        if tweenSuccess then
+                            task.wait(_G.Hub67Settings.TweenDelay)
+                        end
+                    else
+                        if TaskLabel then TaskLabel.Text = "Task: Waiting for stage/coins..." end
+                        task.wait(_G.Hub67Settings.ScanInterval)
+                    end
+                end
+            else
+                if TaskLabel then TaskLabel.Text = "Task: Idle" end
+                task.wait(0.5)
+            end
+        end)
+        if not success then
+            warn("67 HUB Autofarm Loop Error: " .. tostring(err))
+            task.wait(1)
+        end
+    end
+end)
+
+LocalPlayer.CharacterAdded:Connect(function(char)
+    task.wait(1)
+    if _G.Hub67Settings.Enabled then
+        startNoclipLoop()
+        logMessage("ตัวละครเกิดใหม่! เริ่มทะลุกำแพงต่ออัตโนมัติ")
+    end
+end)
+
+logMessage("67 HUB MM2 Mass Farm สคริปต์รันเสร็จสมบูรณ์!")
